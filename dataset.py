@@ -8,6 +8,7 @@
 
 import random
 from pathlib import Path
+import time
 
 import amfm_decompy.basic_tools as basic
 import amfm_decompy.pYAAPT as pYAAPT
@@ -20,6 +21,44 @@ from librosa.filters import mel as librosa_mel_fn
 from librosa.util import normalize
 
 MAX_WAV_VALUE = 32768.0
+
+import numpy as np
+import pyworld as pw
+import scipy.interpolate
+
+def get_world_f0(audio, rate=16000, interp=False):
+    frame_length_ms = 20.0
+    frame_hop_ms = 5.0
+    frame_size = int(rate * frame_length_ms / 1000)  # e.g., 320 samples
+    hop_length = int(rate * frame_hop_ms / 1000)     # e.g., 80 samples
+    to_pad = frame_size // 2                         # 10ms pad on each side
+
+    f0s = []
+    for y in audio.astype(np.float64):
+        y = y.squeeze()
+        y_pad = np.pad(y, (to_pad, to_pad), mode='constant')
+        # pyworld expects float64 mono signal
+        _f0, t = pw.dio(y_pad, fs=rate, frame_period=frame_hop_ms)
+        f0 = pw.stonemask(y_pad, _f0, t, fs=rate)
+
+        if interp:
+            nonzero_idx = np.where(f0 > 0)[0]
+            if len(nonzero_idx) == 0:
+                f0_interp = np.zeros_like(f0)
+            else:
+                interp_fn = scipy.interpolate.interp1d(
+                    nonzero_idx, f0[nonzero_idx], kind='linear',
+                    bounds_error=False,
+                    fill_value=(f0[nonzero_idx[0]], f0[nonzero_idx[-1]])
+                )
+                f0_interp = interp_fn(np.arange(len(f0)))
+        else:
+            f0_interp = f0
+
+        f0s.append(f0[None, None, :])  # Shape: (1, 1, T)
+
+    f0s = np.vstack(f0s)  # Shape: (B, 1, T)
+    return f0s
 
 
 def get_yaapt_f0(audio, rate=16000, interp=False):
@@ -48,8 +87,9 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
         print('max value is ', torch.max(y))
 
     global mel_basis, hann_window
+    # print(y.device)
     if fmax not in mel_basis:
-        mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
+        mel = librosa_mel_fn(sr = sampling_rate, n_fft = n_fft, n_mels = num_mels, fmin = fmin, fmax = fmax)
         mel_basis[str(fmax)+'_'+str(y.device)] = torch.from_numpy(mel).float().to(y.device)
         hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
 
@@ -261,10 +301,12 @@ class CodeDataset(torch.utils.data.Dataset):
             audio = self._sample_interval([audio])[0]
         else:
             audio, code = self._sample_interval([audio, code])
-
-        mel_loss = mel_spectrogram(audio, self.n_fft, self.num_mels,
+        # mel_t0 = time.time()
+        mel_loss = mel_spectrogram(audio.to(self.device), self.n_fft, self.num_mels,
                                    self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax_loss,
                                    center=False)
+        # mel_t1 = time.time()
+        # print(f"[GPU MEL] {mel_t1 - mel_t0:.4f}s")
 
         if self.vqvae:
             feats = {
@@ -272,14 +314,23 @@ class CodeDataset(torch.utils.data.Dataset):
             }
         else:
             feats = {"code": code.squeeze()}
-
+        # f0_t0 = time.time()
         if self.f0:
             try:
-                f0 = get_yaapt_f0(audio.numpy(), rate=self.sampling_rate, interp=self.f0_interp)
+                f0 = get_world_f0(audio.numpy(), rate=self.sampling_rate, interp=self.f0_interp)
+                expected_len = audio.shape[-1] // 80
+                if f0.shape[-1] > expected_len:
+                    f0 = f0[..., :expected_len]
+                elif f0.shape[-1] < expected_len:
+                    pad_len = expected_len - f0.shape[-1]
+                    f0 = np.pad(f0, ((0, 0), (0, 0), (0, pad_len)), mode='constant')
             except:
                 f0 = np.zeros((1, 1, audio.shape[-1] // 80))
             f0 = f0.astype(np.float32)
             feats['f0'] = f0.squeeze(0)
+        # f0_t1 = time.time()
+
+        # print(f"[CPU F0] {f0_t1 - f0_t0:.4f}s")
 
         if self.multispkr:
             feats['spkr'] = self._get_spkr(index)
@@ -304,8 +355,8 @@ class CodeDataset(torch.utils.data.Dataset):
 
             if self.f0_feats:
                 feats['f0_stats'] = torch.FloatTensor([mean, std]).view(-1).numpy()
-
-        return feats, audio.squeeze(0), str(filename), mel_loss.squeeze()
+        mel_loss = mel_loss.squeeze().cpu()
+        return feats, audio.squeeze(0), str(filename), mel_loss
 
     def _get_spkr(self, idx):
         spkr_name = parse_speaker(self.audio_files[idx], self.multispkr)
@@ -399,7 +450,13 @@ class F0Dataset(torch.utils.data.Dataset):
 
         feats = {}
         try:
-            f0 = get_yaapt_f0(audio.numpy(), rate=self.sampling_rate, interp=self.f0_interp)
+            f0 = get_world_f0(audio.numpy(), rate=self.sampling_rate, interp=self.f0_interp)
+            expected_len = audio[0].shape[-1] // 80  
+            if f0.shape[-1] > expected_len:
+                f0 = f0[..., :expected_len]
+            elif f0.shape[-1] < expected_len:
+                pad_len = expected_len - f0.shape[-1]
+                f0 = np.pad(f0, ((0, 0), (0, 0), (0, pad_len)), mode='constant')
         except:
             f0 = np.zeros((1, 1, audio.shape[-1] // 80))
         f0 = f0.astype(np.float32)
